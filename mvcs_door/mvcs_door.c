@@ -332,35 +332,45 @@ size_t mvcs_frame_build(uint8_t addr1, uint8_t addr2, uint8_t control,
 #undef MVCS_EMIT_BIT
 }
 
-/* ======================== 逐字节接收状态机 (4.7.2.3) ======================== */
+/* ======================== 逐字节接收状态机 (4.7.2.3) ========================
+ *
+ * flag (7EH) 边界处理: 每个位先移入 8 位历史窗口 hist, 仅当 hist != 0x7E 时
+ * 才把 8 步前的位延迟提交, 从而保证 flag 的 8 个位不会混入帧体数据;
+ * skip 跳过 flag 检测后仍残留在 hist 中的 flag 位。
+ * bit-unstuffing 基于提交流计数 (dc_ones): 5 个 1 后的 0 为填充位, 丢弃。
+ */
 void mvcs_rx_init(mvcs_rx_t *rx)
 {
-    rx->in_frame = 0;
-    rx->stuffing = 0;
-    rx->ones_run = 0;
-    rx->len      = 0;
-    rx->rx_addr1 = 0;
-    rx->rx_addr2 = 0;
+    rx->in_frame  = 0;
+    rx->stuffing  = 0;
+    rx->ones_run  = 0;
+    rx->dc_ones   = 0;
+    rx->hist      = 0;
+    rx->skip      = 0;
+    rx->len       = 0;
+    rx->frame_len = 0;
+    rx->rx_addr1  = 0;
+    rx->rx_addr2  = 0;
     rx->rx_control = 0;
 }
 
 int mvcs_rx_feed(mvcs_rx_t *rx, uint8_t byte)
 {
-    uint8_t reg = 0;   /* 最近 8 位 (LSB first), 用于 flag 检测 */
-    int     bit;
+    int bit;
 
     for (bit = 0; bit < 8; bit++) {
         uint8_t v = (uint8_t)((byte >> bit) & 1u);
-        reg = (uint8_t)((reg << 1) | v);
 
-        if ((reg & 0xFFu) == MVCS_FLAG) {
-            /* 收到 flag: 帧结束或帧开始 */
+        rx->hist = (uint8_t)((rx->hist << 1) | v);
+
+        /* 1) flag 检测: 数据经 bit-stuffing 后不可能出现 01111110 */
+        if (rx->hist == MVCS_FLAG) {
             if (rx->in_frame && rx->len > 0) {
+                /* 帧结束 */
                 int ev = MVCS_RX_EVENT_FRAME;
 
                 /* 帧体最小 = A1 + A2 + Control + CRC(2B) = 5 字节 */
                 if (rx->len < 2 + MVCS_CONTROL_LEN + MVCS_CRC_LEN) {
-                    /* 帧体过短 (最小 = A1+A2+Control+CRC 2B = 5 字节) */
                     ev = MVCS_RX_EVENT_CRC_ERR;
                 } else {
                     size_t info_len =
@@ -386,63 +396,80 @@ int mvcs_rx_feed(mvcs_rx_t *rx, uint8_t byte)
                     }
                 }
 
+                rx->frame_len = rx->len;    /* 保存帧体长度供上层读取 */
                 rx->in_frame = 0;
                 rx->len      = 0;
+                rx->stuffing = 0;
+                rx->dc_ones  = 0;
                 rx->ones_run = 0;
+                rx->skip     = 7;           /* 跳过 hist 中的 flag 残留位 */
                 return ev;
             }
             /* 帧开始 (或连续 flag): 重新进入帧接收状态 */
             rx->in_frame = 1;
             rx->len      = 0;
-            rx->ones_run = 0;
             rx->stuffing = 0;
-            continue;
-        }
-
-        /* 帧外的位: 丢弃 (PAD 等) */
-        if (!rx->in_frame) {
-            if (v)
-                rx->ones_run++;
-            else
-                rx->ones_run = 0;
-            if (rx->ones_run >= 7) {    /* 连续 7 个 1 = abort, 重新等待 flag */
-                rx->ones_run = 0;
-                return MVCS_RX_EVENT_ABORT;
-            }
-            continue;
-        }
-
-        /* 帧内: 去填充 */
-        if (rx->ones_run == 5 && v == 0) {
-            rx->ones_run = 0;           /* 填充位, 丢弃 */
-            continue;
-        }
-        if (v) {
-            rx->ones_run++;
-            if (rx->ones_run >= 7) {    /* abort: 丢弃本帧 */
-                rx->in_frame = 0;
-                rx->len      = 0;
-                rx->ones_run = 0;
-                return MVCS_RX_EVENT_ABORT;
-            }
-        } else {
+            rx->dc_ones  = 0;
             rx->ones_run = 0;
+            rx->skip     = 7;
+            continue;
         }
 
-        /* 累积数据位 (LSB first): 每 8 个数据位组成一字节 */
-        if (rx->len >= sizeof(rx->body)) {  /* 溢出: 放弃本帧 */
+        /* 2) abort 检测: 原始位流连续 7 个 1 (flag 只有 6 个 1, 不会误报) */
+        if (v)
+            rx->ones_run++;
+        else
+            rx->ones_run = 0;
+        if (rx->ones_run >= 7) {
             rx->in_frame = 0;
             rx->len      = 0;
             rx->stuffing = 0;
+            rx->dc_ones  = 0;
             rx->ones_run = 0;
+            rx->skip     = 0;
             return MVCS_RX_EVENT_ABORT;
         }
-        if (rx->stuffing == 0)
-            rx->body[rx->len] = 0;      /* 新字节开始 */
-        rx->body[rx->len] = (uint8_t)((rx->body[rx->len] >> 1) | (v << 7));
-        rx->stuffing = (rx->stuffing + 1) & 7;  /* 位计数 0..7 */
-        if (rx->stuffing == 0)
-            rx->len++;                  /* 当前字节收集满 */
+
+        /* 3) 跳过 flag 检测后残留在 hist 中的 flag 位 */
+        if (rx->skip > 0) {
+            rx->skip--;
+            continue;
+        }
+
+        /* 4) 延迟提交 8 步前的位 */
+        {
+            uint8_t b = (uint8_t)((rx->hist >> 7) & 1u);
+
+            if (!rx->in_frame)
+                continue;               /* 帧外 (PAD/空闲) 丢弃 */
+
+            /* bit-unstuffing: 去填充后连续 5 个 1 后的 0 是填充位 */
+            if (rx->dc_ones == 5 && b == 0) {
+                rx->dc_ones = 0;
+                continue;
+            }
+            if (b)
+                rx->dc_ones++;
+            else
+                rx->dc_ones = 0;
+
+            /* 组字节 (LSB first): 每 8 个数据位组成一字节 */
+            if (rx->len >= sizeof(rx->body)) {  /* 溢出: 放弃本帧 */
+                rx->in_frame = 0;
+                rx->len      = 0;
+                rx->stuffing = 0;
+                rx->dc_ones  = 0;
+                rx->ones_run = 0;
+                rx->skip     = 0;
+                return MVCS_RX_EVENT_ABORT;
+            }
+            if (rx->stuffing == 0)
+                rx->body[rx->len] = 0;      /* 新字节开始 */
+            rx->body[rx->len] = (uint8_t)((rx->body[rx->len] >> 1) | (b << 7));
+            rx->stuffing = (rx->stuffing + 1) & 7;  /* 位计数 0..7 */
+            if (rx->stuffing == 0)
+                rx->len++;                  /* 当前字节收集满 */
+        }
     }
     return MVCS_RX_EVENT_NONE;
 }

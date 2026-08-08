@@ -189,13 +189,23 @@ size_t mvcs_frame_build(uint8_t addr1, uint8_t addr2, uint8_t control,
  * 返回 MVCS_RX_EVENT_FRAME 时, 本帧 CRC 校验已通过, 帧体解析结果:
  *   rx.body[0] = A1 (设备类型), rx.body[1] = A2 (门号), rx.body[2] = Control,
  *   rx.body[3 .. 3+info_len-1] = Information, 其后 2 字节为帧内 CRC;
- *   info_len = rx.len - (2 + MVCS_CONTROL_LEN + MVCS_CRC_LEN)。
- * 返回 CRC_ERR / ABORT 时本帧已丢弃 (协议规定接收错误不回复, 4.7.2.3-3)。 */
+ *   info_len = rx.frame_len - (2 + MVCS_CONTROL_LEN + MVCS_CRC_LEN)。
+ *   (事件返回时 rx.len 已复位为 0, 帧体长度保存在 rx.frame_len)
+ * 返回 CRC_ERR / ABORT 时本帧已丢弃 (协议规定接收错误不回复, 4.7.2.3-3)。
+ *
+ * 实现要点 (HDLC flag 边界):
+ *   - 每个收到的位先移入 8 位历史窗口 hist; 仅当 hist != 0x7E (flag) 时,
+ *     才把 8 步前的位延迟提交, 因此 flag 的全部 8 位不会混入帧体数据
+ *   - skip 用于跳过 flag 检测后仍残留在 hist 中的 flag 位 */
 typedef struct {
     int      in_frame;        /* 是否已在帧内 (收到 opening flag) */
-    int      stuffing;        /* 当前接收字节已收集位数 0..7 (去填充/组字节用) */
-    int      ones_run;        /* 连续 1 计数 (去填充用) */
-    size_t   len;             /* 已收集的帧体字节数 (不含 flag) */
+    int      stuffing;        /* 当前接收字节已收集位数 0..7 (组字节用) */
+    int      ones_run;        /* 原始位流连续 1 计数 (abort 检测) */
+    int      dc_ones;         /* 去填充后连续 1 计数 (bit-unstuffing) */
+    uint8_t  hist;            /* 8 位历史窗口 (flag 检测 + 延迟提交) */
+    int      skip;            /* flag 残留位跳过计数 */
+    size_t   len;             /* 当前帧已收集的帧体字节数 (不含 flag) */
+    size_t   frame_len;       /* 最近完成帧的帧体长度 (FRAME 事件后有效) */
     uint8_t  body[MVCS_FRAME_MAX_LEN];
     uint8_t  rx_addr1;        /* 解析出的地址 (供上层过滤) */
     uint8_t  rx_addr2;

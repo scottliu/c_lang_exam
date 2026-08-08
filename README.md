@@ -52,13 +52,35 @@ ping.exe 127.0.0.1
 - `mvcs_door.h`：协议常量、CDR/CD 字段结构体、API 声明
 - `mvcs_door.c`：CRC-CCITT、CDR/CD 编解码、HDLC 帧构建（含 bit-stuffing）、逐字节接收状态机
 - `mvcs_door_demo.c`：自测/演示（CRC 向量校验、收发往返、20 ms 轮询模拟、错误注入）
+- `mvcs_door_monitor.c`：串口线路监听工具（Windows / Linux 跨平台）
 
 ### 编译方法
 ```bash
 cd mvcs_door
 clang -Wall -Wextra -O2 -o mvcs_door_demo mvcs_door_demo.c mvcs_door.c
 ./mvcs_door_demo
+
+clang -Wall -Wextra -O2 -o mvcs_door_monitor mvcs_door_monitor.c mvcs_door.c
+./mvcs_door_monitor COM3            # Windows: 监听串口 COM3
+./mvcs_door_monitor /dev/ttyUSB0    # Linux: 监听 RS485 总线
+./mvcs_door_monitor --file cap.bin  # 离线回放抓包字节流
+./mvcs_door_monitor --selftest      # 内置帧回放自测
 ```
+
+### 监听工具用法
+```
+mvcs_door_monitor <串口设备> [-b 波特率] [-v] [-o 日志] [--no-log]
+mvcs_door_monitor --file <字节流文件> [-v]        # 离线分析
+mvcs_door_monitor --selftest                     # 自测
+```
+监听程序读取总线字节流，复用接收状态机解析 HDLC 帧，按设备类型区分
+CDR（MVCS→门）/ CD（门→MVCS），解码并打印发车测试、测量值（按 0.1 s/bit、
+0.05 A/bit、5 mm/bit 换算）、门状态、内部信息、故障信息与程序版本/校验和。
+`-v` 额外打印每帧原始字节；串口数据位/校验/停止位文档未明确，默认 8N1。
+
+**日志**：每次运行自动把监听结果写入日志文件，控制台与日志同步输出。
+默认文件名 `mvcs_monitor_YYYYMMDD_HHMMSS.log`（每次运行一个新文件，追加写入，
+不覆盖已有内容），可用 `-o <路径>` 指定文件，`--no-log` 关闭日志。
 
 > 说明：`mvcs_door.c` 中的 CRC 初值/字节序为 HDLC 常用约定，文档未明确给出；
 > 若与既有系统对接，需按对方实现调整 `MVCS_CRC_INIT` 与 CRC 字节序。

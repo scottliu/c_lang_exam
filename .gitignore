@@ -1,3 +1,5 @@
 /ping/*.exe
 /.reasonix
 *.exe
+mvcs_monitor_*.log
+reasonix.toml
