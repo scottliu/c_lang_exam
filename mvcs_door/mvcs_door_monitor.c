@@ -37,6 +37,7 @@
 #  include <fcntl.h>
 #  include <sys/time.h>
 #  include <termios.h>
+#  include <time.h>       /* struct tm / localtime_r */
 #  include <unistd.h>
 #endif
 
